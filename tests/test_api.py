@@ -557,3 +557,230 @@ def test_allergen_cut_does_not_modify_data(client):
     assert client.get(f"/recipes/{cookie['id']}").json() == cookie_before
     assert client.get(f"/recipes/{cream['id']}").json() == cream_before
     assert client.get("/ingredients").json() == ingredients_before
+
+
+# ---------- 多配方合并备料清单 ----------
+
+def test_material_plan_expands_multiplies_and_merges(client):
+    """多层批数相乘、重复引用各计、按原料与单位合并，按编号/单位排序。"""
+    flour = make_ingredient(client, "面粉")
+    butter = make_ingredient(client, "黄油")
+    sugar = make_ingredient(client, "砂糖")
+    cream = make_recipe(client, "黄油霜", [
+        {"ref_type": "ingredient", "ref_id": butter["id"], "quantity": 250, "unit": "g"},
+        {"ref_type": "ingredient", "ref_id": sugar["id"], "quantity": 100, "unit": "g"},
+    ])
+    # 曲奇：面粉 300g/批 + 黄油霜 2 份/批（同一子配方重复引用，每份都计入）
+    cookie = make_recipe(client, "曲奇", [
+        {"ref_type": "ingredient", "ref_id": flour["id"], "quantity": 300, "unit": "g"},
+        {"ref_type": "recipe", "ref_id": cream["id"], "quantity": 1, "unit": "份"},
+        {"ref_type": "recipe", "ref_id": cream["id"], "quantity": 1, "unit": "份"},
+    ])
+
+    # 曲奇 2 批：面粉 600；黄油 250×(1+1)×2 = 1000；糖 100×(1+1)×2 = 400
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [{"recipe_id": cookie["id"], "batches": 2}],
+    })
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["item_count"] == 3
+    assert data["items"] == [
+        {"ingredient_id": flour["id"], "ingredient_name": "面粉",
+         "unit": "g", "quantity": "600"},
+        {"ingredient_id": butter["id"], "ingredient_name": "黄油",
+         "unit": "g", "quantity": "1000"},
+        {"ingredient_id": sugar["id"], "ingredient_name": "砂糖",
+         "unit": "g", "quantity": "400"},
+    ]
+
+
+def test_material_plan_multi_recipe_and_deep_chain(client):
+    """多个请求配方合并；深层路径批数连乘；同一配方出现多次按各自批数累加。"""
+    a = make_ingredient(client, "原料A")
+    b = make_ingredient(client, "原料B")
+    inner = make_recipe(client, "内馅", [
+        {"ref_type": "ingredient", "ref_id": a["id"], "quantity": 2, "unit": "g"},
+    ])
+    mid = make_recipe(client, "中层", [
+        {"ref_type": "recipe", "ref_id": inner["id"], "quantity": 3, "unit": "份"},
+        {"ref_type": "ingredient", "ref_id": b["id"], "quantity": 5, "unit": "g"},
+    ])
+    outer = make_recipe(client, "成品", [
+        {"ref_type": "recipe", "ref_id": mid["id"], "quantity": 1.5, "unit": "份"},
+    ])
+
+    # 成品 2 批：A = 2×3×1.5×2 = 18；B = 5×1.5×2 = 15
+    # 中层 1 批：A += 2×3 = 6（=24）；B += 5（=20）
+    # 中层 0.5 批：A += 3（=27）；B += 2.5（=22.5）
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [
+            {"recipe_id": outer["id"], "batches": 2},
+            {"recipe_id": mid["id"], "batches": 1},
+            {"recipe_id": mid["id"], "batches": 0.5},
+        ],
+    })
+    assert resp.status_code == 200, resp.text
+    items = {(i["ingredient_id"], i["unit"]): i["quantity"]
+             for i in resp.json()["items"]}
+    assert items[(a["id"], "g")] == "27"
+    assert items[(b["id"], "g")] == "22.5"
+
+
+def test_material_plan_decimal_accumulation_is_exact(client):
+    """十进制累加：0.1 + 0.2 必须得到 0.3，而不是浮点误差。"""
+    salt = make_ingredient(client, "盐")
+    r1 = make_recipe(client, "配方甲", [
+        {"ref_type": "ingredient", "ref_id": salt["id"], "quantity": 0.1, "unit": "g"},
+    ])
+    r2 = make_recipe(client, "配方乙", [
+        {"ref_type": "ingredient", "ref_id": salt["id"], "quantity": 0.2, "unit": "g"},
+    ])
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [
+            {"recipe_id": r1["id"], "batches": 1},
+            {"recipe_id": r2["id"], "batches": 1},
+        ],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"][0]["quantity"] == "0.3"
+
+
+def test_material_plan_same_ingredient_different_units_not_converted(client):
+    """同一原料不同单位分别成行，不做换算。"""
+    milk = make_ingredient(client, "牛奶")
+    recipe = make_recipe(client, "奶冻", [
+        {"ref_type": "ingredient", "ref_id": milk["id"], "quantity": 200, "unit": "ml"},
+        {"ref_type": "ingredient", "ref_id": milk["id"], "quantity": 1, "unit": "kg"},
+    ])
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [{"recipe_id": recipe["id"], "batches": 1}],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == [
+        {"ingredient_id": milk["id"], "ingredient_name": "牛奶",
+         "unit": "kg", "quantity": "1"},
+        {"ingredient_id": milk["id"], "ingredient_name": "牛奶",
+         "unit": "ml", "quantity": "200"},
+    ]
+
+
+def test_material_plan_missing_quantity_422_lists_entry_ids(client):
+    """任一可达条目缺少 quantity -> 422，列出问题条目，不返回部分清单。"""
+    a = make_ingredient(client, "原料A")
+    b = make_ingredient(client, "原料B")
+    sub = make_recipe(client, "子配方", [
+        {"ref_type": "ingredient", "ref_id": a["id"], "quantity": 1, "unit": "g"},
+        {"ref_type": "ingredient", "ref_id": b["id"]},  # 缺 quantity 与 unit
+    ])
+    bad_sub_entry = sub["entries"][1]["id"]
+    main = make_recipe(client, "主配方", [
+        {"ref_type": "recipe", "ref_id": sub["id"]},  # 根条目也缺 quantity/unit
+        {"ref_type": "ingredient", "ref_id": a["id"], "quantity": 9, "unit": "g"},
+    ])
+    bad_root_entry = main["entries"][0]["id"]
+
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [{"recipe_id": main["id"], "batches": 1}],
+    })
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["code"] == "MATERIAL_PLAN_INVALID_ENTRIES"
+    assert detail["entry_ids"] == sorted({bad_root_entry, bad_sub_entry})
+    assert "items" not in detail  # 不返回部分清单
+
+
+def test_material_plan_ingredient_without_unit_422(client):
+    """原料条目有 quantity 但缺 unit -> 422 并列出该条目。"""
+    a = make_ingredient(client, "原料A")
+    recipe = make_recipe(client, "配方", [
+        {"ref_type": "ingredient", "ref_id": a["id"], "quantity": 10},  # 缺 unit
+    ])
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [{"recipe_id": recipe["id"], "batches": 1}],
+    })
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["entry_ids"] == [recipe["entries"][0]["id"]]
+
+
+def test_material_plan_sub_recipe_unit_not_fen_422(client):
+    """子配方条目的 unit 不是「份」-> 422；但子树仍照常检查并汇总问题。"""
+    a = make_ingredient(client, "原料A")
+    sub = make_recipe(client, "子配方", [
+        {"ref_type": "ingredient", "ref_id": a["id"]},  # 子树内缺 quantity+unit
+    ])
+    sub_leaf = sub["entries"][0]["id"]
+    main = make_recipe(client, "主配方", [
+        {"ref_type": "recipe", "ref_id": sub["id"], "quantity": 1, "unit": "g"},  # 应为「份」
+    ])
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [{"recipe_id": main["id"], "batches": 1}],
+    })
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["entry_ids"] == sorted(
+        {main["entries"][0]["id"], sub_leaf})
+
+
+def test_material_plan_unknown_recipe_404(client):
+    """请求的配方不存在 -> 404（即使列表中还存在有效配方）。"""
+    a = make_ingredient(client, "原料A")
+    recipe = make_recipe(client, "配方", [
+        {"ref_type": "ingredient", "ref_id": a["id"], "quantity": 1, "unit": "g"},
+    ])
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [
+            {"recipe_id": recipe["id"], "batches": 1},
+            {"recipe_id": "REC-9999", "batches": 2},
+        ],
+    })
+    assert resp.status_code == 404
+    detail = resp.json()["detail"]
+    assert detail["code"] == "RECIPE_NOT_FOUND"
+    assert detail["recipe_id"] == "REC-9999"
+
+
+def test_material_plan_non_positive_batches_422(client):
+    """批次数必须为正数：0 或负数被请求校验拒绝（422）。"""
+    recipe = make_recipe(client, "空配方", [])
+    for bad in (0, -1):
+        resp = client.post("/recipes/material-plan", json={
+            "recipes": [{"recipe_id": recipe["id"], "batches": bad}],
+        })
+        assert resp.status_code == 422
+
+
+def test_material_plan_empty_recipes_rejected(client):
+    """至少要给出一个配方。"""
+    resp = client.post("/recipes/material-plan", json={"recipes": []})
+    assert resp.status_code == 422
+
+
+def test_material_plan_empty_recipe_gives_empty_items(client):
+    """空配方的清单为空。"""
+    recipe = make_recipe(client, "空配方", [])
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [{"recipe_id": recipe["id"], "batches": 3}],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"items": [], "item_count": 0}
+
+
+def test_material_plan_does_not_modify_data(client):
+    """备料清单为只读：调用后配方与原料数据均不变。"""
+    flour, butter, sugar, cream, cookie = _build_sample(client)
+    recipes_before = client.get("/recipes").json()
+    cookie_before = client.get(f"/recipes/{cookie['id']}").json()
+    cream_before = client.get(f"/recipes/{cream['id']}").json()
+    ingredients_before = client.get("/ingredients").json()
+
+    resp = client.post("/recipes/material-plan", json={
+        "recipes": [
+            {"recipe_id": cookie["id"], "batches": 2},
+            {"recipe_id": cream["id"], "batches": 1.5},
+        ],
+    })
+    assert resp.status_code == 200, resp.text
+
+    assert client.get("/recipes").json() == recipes_before
+    assert client.get(f"/recipes/{cookie['id']}").json() == cookie_before
+    assert client.get(f"/recipes/{cream['id']}").json() == cream_before
+    assert client.get("/ingredients").json() == ingredients_before

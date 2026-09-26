@@ -204,3 +204,32 @@ class AllergenCutOut(BaseModel):
     entry_ids: list[str]              # 最少需要停用的条目编号（升序）
     entries: list[AllergenCutEntry]   # 每个条目覆盖的原料路径
     cut_path_count: int               # 被截断路径总数
+
+
+# ---------- 多配方合并备料清单（只读） ----------
+
+class MaterialPlanRecipeIn(BaseModel):
+    """一个待备料配方及其正数批次数。"""
+
+    recipe_id: str = Field(min_length=1, max_length=16)
+    batches: float = Field(gt=0)
+
+
+class MaterialPlanIn(BaseModel):
+    """多个配方的备料请求：各自给出正数批次数，合并成一张清单。"""
+
+    recipes: list[MaterialPlanRecipeIn] = Field(min_length=1)
+
+
+class MaterialPlanItem(BaseModel):
+    """一种原料在某个单位下的合并用量（十进制累加，字符串原样返回）。"""
+
+    ingredient_id: str
+    ingredient_name: str
+    unit: str
+    quantity: str
+
+
+class MaterialPlanOut(BaseModel):
+    items: list[MaterialPlanItem]     # 按原料编号、单位排序
+    item_count: int

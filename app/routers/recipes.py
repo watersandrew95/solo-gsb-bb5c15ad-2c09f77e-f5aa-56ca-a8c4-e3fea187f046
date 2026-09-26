@@ -11,6 +11,8 @@ from app.schemas import (
     AllergenCutOut,
     ExpansionOut,
     LabelPreviewOut,
+    MaterialPlanIn,
+    MaterialPlanOut,
     RecipeIn,
     RecipeOut,
     RecipeSummary,
@@ -41,6 +43,12 @@ def list_recipes(db: Session = Depends(get_db)):
         }
         for r in db.scalars(select(Recipe).order_by(Recipe.id))
     ]
+
+
+@router.post("/material-plan", response_model=MaterialPlanOut,
+             summary="多配方合并备料清单（只读）：逐层展开、批数相乘、按原料与单位十进制累加")
+def create_material_plan(payload: MaterialPlanIn, db: Session = Depends(get_db)):
+    return services.build_material_plan(db, payload.recipes)
 
 
 @router.get("/{recipe_id}", response_model=RecipeOut, summary="查询配方及其条目")

@@ -1,5 +1,5 @@
 """业务逻辑：登记原料、保存配方（校验 + 原子写入）、展开配方、预演标签变化、
-计算过敏原截断的最小停用方案（只读）。
+计算过敏原截断的最小停用方案、生成多配方合并备料清单（后两者及预演均为只读）。
 
 保存配方的规则：
 1. 所有引用的原料 / 子配方必须已存在，否则整体拒绝；
@@ -15,6 +15,7 @@
 """
 import itertools
 from collections import defaultdict
+from decimal import Decimal
 from types import SimpleNamespace
 
 from sqlalchemy import select
@@ -538,3 +539,91 @@ def plan_allergen_cut(db: Session, recipe_id: str, allergen: str) -> dict:
     plan["entries"] = entries
     plan["cut_path_count"] = len(cut_indices)
     return plan
+
+
+# ---------- 多配方合并备料清单（只读） ----------
+
+def _decimal_text(value) -> str:
+    """Decimal 转字符串：去掉多余尾零（整数不带小数点），但绝不使用科学计数法。"""
+    text = format(value.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def build_material_plan(db: Session, items: list) -> dict:
+    """为多个配方的各自正数批次数生成合并备料清单（只读，不写入任何数据）。
+
+    沿现有配方引用逐层展开：子配方条目的 quantity 表示每批使用的子配方批数，
+    路径上的批数逐层相乘；同一子配方被重复引用时，每条引用分别展开、分别计入。
+    原料用量按（原料编号, unit）分组，以十进制累加；不同单位不做换算。
+
+    任一可达条目缺少 quantity、原料条目缺少 unit，或子配方条目的 unit 不是「份」，
+    则收集全部问题条目编号后一次性返回 422，不返回部分清单。
+    """
+    # 1. 请求的配方必须全部存在，否则 404
+    roots: list[tuple[str, Decimal]] = []
+    for item in items:
+        recipe = db.get(Recipe, item.recipe_id)
+        if recipe is None:
+            raise ApiError(404, "RECIPE_NOT_FOUND", f"配方不存在：{item.recipe_id}",
+                           {"recipe_id": item.recipe_id})
+        roots.append((recipe.id, Decimal(str(item.batches))))
+
+    recipes, ingredients, entries_by_recipe = _load_graph(db)
+
+    # 2. 深度优先展开，沿途收集全部问题条目；multiplier 为 None 表示路径已失效
+    problems: list[str] = []
+    totals: dict[tuple[str, str], Decimal] = defaultdict(lambda: Decimal("0"))
+
+    def walk(recipe_id: str, multiplier, ancestors: frozenset[str]) -> None:
+        for entry in entries_by_recipe.get(recipe_id, []):
+            entry_id = entry["entry_id"]
+            qty_ok = entry["quantity"] is not None
+            unit_ok = entry["unit"] is not None and entry["unit"] != ""
+            if not qty_ok:
+                problems.append(entry_id)
+
+            if entry["ref_type"] == "ingredient":
+                if not unit_ok:  # 原料条目缺少 unit
+                    problems.append(entry_id)
+                elif multiplier is not None and qty_ok:
+                    totals[(entry["ref_id"], entry["unit"])] += (
+                        multiplier * Decimal(str(entry["quantity"])))
+                continue
+
+            # 子配方条目：unit 必须是「份」
+            if entry["unit"] != "份":
+                problems.append(entry_id)
+            # 保存时已保证无环且引用存在；此处防御性截断，避免脏数据死循环
+            if entry["ref_id"] in ancestors:
+                continue
+            next_multiplier = (
+                multiplier * Decimal(str(entry["quantity"]))
+                if multiplier is not None and qty_ok else None)
+            walk(entry["ref_id"], next_multiplier, ancestors | {entry["ref_id"]})
+
+    for recipe_id, batches in roots:
+        walk(recipe_id, batches, frozenset({recipe_id}))
+
+    # 3. 任何问题都整体拒绝，不返回部分清单
+    if problems:
+        entry_ids = sorted(set(problems))
+        raise ApiError(
+            422, "MATERIAL_PLAN_INVALID_ENTRIES",
+            "存在无法参与备料计算的条目：条目缺少 quantity、原料条目缺少 unit，"
+            "或子配方条目的 unit 不是「份」",
+            {"entry_ids": entry_ids, "entry_count": len(entry_ids)},
+        )
+
+    # 4. 按原料编号、单位排序，十进制累加结果以字符串返回
+    plan_items = []
+    for ingredient_id, unit in sorted(totals):
+        ingredient = ingredients.get(ingredient_id)
+        plan_items.append({
+            "ingredient_id": ingredient_id,
+            "ingredient_name": ingredient.name if ingredient is not None else ingredient_id,
+            "unit": unit,
+            "quantity": _decimal_text(totals[(ingredient_id, unit)]),
+        })
+    return {"items": plan_items, "item_count": len(plan_items)}

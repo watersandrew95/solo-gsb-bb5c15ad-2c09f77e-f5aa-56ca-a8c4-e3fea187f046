@@ -1,5 +1,5 @@
 """业务逻辑：登记原料、保存配方（校验 + 原子写入）、展开配方、预演标签变化、
-计算过敏原截断的最小停用方案（只读）。
+计算过敏原截断的最小停用方案（只读）、按批次数合并备料清单（只读）。
 
 保存配方的规则：
 1. 所有引用的原料 / 子配方必须已存在，否则整体拒绝；
@@ -15,13 +15,14 @@
 """
 import itertools
 from collections import defaultdict
+from decimal import Decimal
 from types import SimpleNamespace
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Ingredient, Recipe, RecipeEntry, SeqCounter, utcnow
-from app.schemas import RecipeIn
+from app.schemas import MaterialPlanItemIn, RecipeIn
 
 
 class ApiError(Exception):
@@ -538,3 +539,86 @@ def plan_allergen_cut(db: Session, recipe_id: str, allergen: str) -> dict:
     plan["entries"] = entries
     plan["cut_path_count"] = len(cut_indices)
     return plan
+
+
+# ---------- 合并备料清单（只读） ----------
+
+def _to_decimal(value: float) -> Decimal:
+    """float 经 str 转为 Decimal：以用户输入的十进制表现为准，避免二进制浮点尾差。"""
+    return Decimal(str(value))
+
+
+def plan_materials(db: Session, items: list[MaterialPlanItemIn]) -> dict:
+    """多个配方按各自批次数合并备料：展开全部引用，按（原料, 单位）汇总用量。
+
+    只读操作，不写入任何数据。规则：
+    1. 子配方条目的 quantity 表示「每批父配方使用几批该子配方」，
+       路径上的批数（请求批次数 × 各层 quantity）逐层相乘；
+    2. 同一子配方被重复引用时，每条引用独立展开、独立计入；
+    3. 原料用量按（原料编号, unit）分组，以 Decimal 累加、用字符串返回，
+       不同单位不换算；
+    4. 任一可达条目缺 quantity、原料条目缺 unit、子配方条目 unit 不是「份」，
+       整体拒绝（422）并列出全部问题条目编号，不返回部分清单。
+    """
+    requested = [item.recipe_id for item in items]
+    found = set(db.scalars(select(Recipe.id).where(Recipe.id.in_(requested))))
+    missing = sorted({rid for rid in requested if rid not in found})
+    if missing:
+        raise ApiError(404, "RECIPE_NOT_FOUND",
+                       "配方不存在：" + "、".join(missing), {"missing": missing})
+
+    _, ingredients, entries_by_recipe = _load_graph(db)
+
+    problems: dict[str, set[str]] = defaultdict(set)  # 条目编号 -> 问题类型集合
+    totals: dict[tuple[str, str], Decimal] = defaultdict(Decimal)  # (原料, 单位) -> 总量
+
+    def walk(recipe_id: str, batches: Decimal, ancestors: frozenset[str]) -> None:
+        for entry in entries_by_recipe.get(recipe_id, []):
+            entry_id = entry["entry_id"]
+            quantity = entry["quantity"]
+            if quantity is None:
+                problems[entry_id].add("missing_quantity")
+            if entry["ref_type"] == "ingredient":
+                if not entry["unit"]:
+                    problems[entry_id].add("missing_unit")
+                elif quantity is not None:
+                    key = (entry["ref_id"], entry["unit"])
+                    totals[key] += batches * _to_decimal(quantity)
+                continue
+            if entry["unit"] != "份":
+                problems[entry_id].add("invalid_unit")
+            # 保存时已保证无环；此处仍防御性截断，避免脏数据导致死循环
+            if entry["ref_id"] in ancestors:
+                continue
+            # quantity 缺失时无法折算批数，但仍向下校验可达条目（结果整体会被 422 拒绝）
+            deeper = batches * _to_decimal(quantity) if quantity is not None else batches
+            walk(entry["ref_id"], deeper, ancestors | {entry["ref_id"]})
+
+    for item in items:
+        walk(item.recipe_id, _to_decimal(item.batches), frozenset({item.recipe_id}))
+
+    if problems:
+        raise ApiError(
+            422, "INVALID_RECIPE_DATA",
+            "存在缺少备料信息的配方条目，无法生成备料清单",
+            {
+                "entry_ids": sorted(problems),
+                "problems": [
+                    {"entry_id": entry_id, "issue": issue}
+                    for entry_id in sorted(problems)
+                    for issue in sorted(problems[entry_id])
+                ],
+            },
+        )
+
+    return {
+        "materials": [
+            {
+                "ingredient_id": ingredient_id,
+                "ingredient_name": ingredients[ingredient_id].name,
+                "unit": unit,
+                "quantity": format(total.normalize(), "f"),
+            }
+            for (ingredient_id, unit), total in sorted(totals.items())
+        ],
+    }

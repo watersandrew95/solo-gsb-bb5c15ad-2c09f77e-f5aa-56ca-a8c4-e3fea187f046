@@ -1,6 +1,6 @@
 # 食品工坊配方标签核查 API
 
-供小型食品工坊使用的配方标签核对服务：登记原料及其过敏原，用**带独立条目编号**的原料或子配方组成配方；保存配方时校验引用与循环；查询时展开全部引用路径并按过敏原汇总每条来源路径，用于成品标签核对。改动配方前还可用**标签预演**接口，在不写入数据库的前提下预演整体替换后的过敏原变化，判断是否需要重印标签；需要剔除某过敏原时，可用**过敏原截断**接口算出最少需要停用哪些条目（只读，给出方案但不改动数据）。
+供小型食品工坊使用的配方标签核对服务：登记原料及其过敏原，用**带独立条目编号**的原料或子配方组成配方；保存配方时校验引用与循环；查询时展开全部引用路径并按过敏原汇总每条来源路径，用于成品标签核对。改动配方前还可用**标签预演**接口，在不写入数据库的前提下预演整体替换后的过敏原变化，判断是否需要重印标签；需要剔除某过敏原时，可用**过敏原截断**接口算出最少需要停用哪些条目（只读，给出方案但不改动数据）；投产前还可用**合并备料**接口，按批次数展开多个配方并汇总原料用量（只读）。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · SQLite
 
@@ -54,6 +54,7 @@ pytest                                       # 运行测试
 | PUT | `/recipes/{id}` | 整体替换配方组成 |
 | POST | `/recipes/{id}/label-preview` | **标签预演**：接收与整体替换相同的请求，校验相同但**不写入数据库**，返回替换前后的过敏原变化 |
 | POST | `/recipes/{id}/allergen-cut` | **过敏原截断**：求最少需要停用哪些条目才能截断含目标过敏原的全部原料路径（只读，不写入） |
+| POST | `/recipes/material-plan` | **合并备料**：接收多个配方及各自批次数，展开全部引用后按原料 + 单位汇总用量（只读，不写入） |
 | GET | `/recipes` / `/recipes/{id}` | 查询配方及其条目 |
 | GET | `/recipes/{id}/expansion` | **标签核对**：展开全部引用路径，按过敏原汇总来源 |
 
@@ -98,6 +99,37 @@ pytest                                       # 运行测试
 | `entry_ids` | 最少需要停用的条目编号（升序） |
 | `entries` | 每个待停用条目覆盖（截断）的原料路径：条目编号序列 + 来源原料 |
 | `cut_path_count` | 被截断路径总数（一条路径被多个条目覆盖时只计一次） |
+
+## 合并备料（material-plan）
+
+`POST /recipes/material-plan` 接收多个配方编号及各自的**正数批次数**，沿配方引用逐层展开后生成合并备料清单。**只读**接口：不改动任何配方或原料数据。
+
+请求体：
+
+```json
+{
+  "items": [
+    {"recipe_id": "REC-0002", "batches": 2},
+    {"recipe_id": "REC-0001", "batches": 1}
+  ]
+}
+```
+
+规则：
+
+1. **批数逐层相乘**：子配方条目的 `quantity` 表示「每批父配方使用几批该子配方」，与请求批次数一起沿引用路径逐层相乘；
+2. **重复引用各计各的**：同一子配方被多条条目引用时，每条引用独立展开、独立计入；
+3. **按原料 + 单位分组**：用量按（原料编号, unit）分组，以十进制（Decimal）累加并用**字符串**返回（避免浮点尾差）；按原料编号、单位排序，**不同单位不换算**；
+4. **数据不全整体拒绝**：任一可达条目缺 `quantity`、原料条目缺 `unit`，或子配方条目 `unit` 不是「份」→ `422 INVALID_RECIPE_DATA`，响应在 `entry_ids` 与 `problems` 中列出全部问题条目编号，**不返回部分清单**；
+5. 请求的配方不存在 → `404 RECIPE_NOT_FOUND`。
+
+响应字段：
+
+| 字段 | 含义 |
+|---|---|
+| `materials[].ingredient_id` / `ingredient_name` | 原料编号 / 名称 |
+| `materials[].unit` | 单位（同一原料的不同单位各占一行，不换算） |
+| `materials[].quantity` | 该原料在该单位下的总用量，十进制字符串 |
 
 ## 使用示例
 
@@ -145,6 +177,13 @@ curl -X POST $B/recipes/REC-0002/label-preview -H 'Content-Type: application/jso
 # 6. 过敏原截断：要剔除「乳」，最少需要停用哪些条目？（只读，不写入）
 curl -X POST $B/recipes/REC-0002/allergen-cut -H 'Content-Type: application/json' \
   -d '{"allergen":"乳"}'
+
+# 7. 合并备料：曲奇 2 批 + 黄油霜 1 批，汇总原料用量（只读，不写入）
+curl -X POST $B/recipes/material-plan -H 'Content-Type: application/json' -d '{
+  "items":[
+    {"recipe_id":"REC-0002","batches":2},
+    {"recipe_id":"REC-0001","batches":1}
+  ]}'
 ```
 
 展开结果中，每条来源路径由条目编号依次记录（如 `["ENT-000004","ENT-000001"]` 表示「曲奇第 2 行 → 黄油霜第 1 行 → 黄油」）；`allergen_summary` 按过敏原分组，同一子配方使用两次会列出两条独立来源路径：
@@ -211,6 +250,18 @@ curl -X POST $B/recipes/REC-0002/allergen-cut -H 'Content-Type: application/json
 }
 ```
 
+第 7 步的备料清单如下——黄油霜共需 5 批（曲奇 2 批 × 每批 1 份 × 2 处引用 + 直接备料 1 批），用量按原料 + 单位汇总为十进制字符串：
+
+```json
+{
+  "materials": [
+    {"ingredient_id": "ING-0001", "ingredient_name": "黄油", "unit": "g", "quantity": "1250"},
+    {"ingredient_id": "ING-0002", "ingredient_name": "面粉", "unit": "g", "quantity": "600"},
+    {"ingredient_id": "ING-0003", "ingredient_name": "砂糖", "unit": "g", "quantity": "500"}
+  ]
+}
+```
+
 ## 项目结构
 
 ```
@@ -219,9 +270,9 @@ app/
 ├── database.py        # 引擎 / 会话 / 建表（DATABASE_URL 可配置）
 ├── models.py          # Ingredient / Recipe / RecipeEntry / 发号器
 ├── schemas.py         # 请求与响应模型
-├── services.py        # 校验（引用、循环）、原子保存、展开汇总、标签预演对比、过敏原截断最小命中集
+├── services.py        # 校验（引用、循环）、原子保存、展开汇总、标签预演对比、过敏原截断最小命中集、合并备料
 └── routers/           # /ingredients、/recipes 路由
-tests/test_api.py      # 29 个行为测试（校验、循环、原子性、展开、标签预演、过敏原截断）
+tests/test_api.py      # 43 个行为测试（校验、循环、原子性、展开、标签预演、过敏原截断、合并备料）
 Dockerfile             # python:3.12-slim，构建时安装依赖
 docker-compose.yml     # 一条命令启动，端口与数据卷在此配置
 ```

@@ -11,6 +11,8 @@ from app.schemas import (
     AllergenCutOut,
     ExpansionOut,
     LabelPreviewOut,
+    MaterialPlanIn,
+    MaterialPlanOut,
     RecipeIn,
     RecipeOut,
     RecipeSummary,
@@ -24,6 +26,12 @@ router = APIRouter(prefix="/recipes", tags=["配方"])
 def create_recipe(payload: RecipeIn, db: Session = Depends(get_db)):
     recipe = services.save_recipe(db, payload)
     return services.recipe_to_out(db, recipe)
+
+
+@router.post("/material-plan", response_model=MaterialPlanOut,
+             summary="合并备料清单：多个配方按批次数展开并汇总原料用量（只读，不写入）")
+def plan_materials(payload: MaterialPlanIn, db: Session = Depends(get_db)):
+    return services.plan_materials(db, payload.items)
 
 
 @router.get("", response_model=list[RecipeSummary], summary="列出全部配方")
